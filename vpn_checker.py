@@ -53,8 +53,8 @@ CACHE_DIR = Path.home() / '.cache' / 'vpn-checker'
 LOG_FILE = CACHE_DIR / 'vpn-checker.log'
 
 # Check intervals
-IFACE_CHECK_INTERVAL = 3   # seconds — fast local check
-IP_CHECK_INTERVAL = 60     # seconds — slow API check
+IFACE_CHECK_INTERVAL = 1    # seconds — fast local check
+IP_CHECK_INTERVAL = 60      # seconds — slow API check
 
 DEFAULT_CONFIG = {
     'expected_country': '',
@@ -234,6 +234,8 @@ class VPNChecker:
         self.last_status = None
         self.last_info = None
         self._last_iface = None
+        self._last_known_country = ''
+        self._strict_active = False
         self.indicator = None
         self.menu_items = {}
         self._check_lock = threading.Lock()
@@ -336,6 +338,13 @@ class VPNChecker:
                 f'[iface] iface={iface} → status=True (reason=heuristic)'
             )
             return True
+        home_country = config_snapshot.get('home_country', '').strip().upper()
+        if home_country and self._last_known_country == home_country:
+            self._logger.log(
+                f'[iface] iface={iface} last_country={self._last_known_country} '
+                f'home={home_country} → status=False (reason=known_home_country)'
+            )
+            return False
         self._logger.log(
             f'[iface] iface={iface} → status=None (reason=no_prefix,heuristic=no_match)'
         )
@@ -355,16 +364,7 @@ class VPNChecker:
         home_country = config_snapshot.get('home_country', '').strip().upper()
         country = info.get('country', '?') if info else '?'
 
-        # 2. Expected country match
-        if expected_country and country and country != '?':
-            matched = country == expected_country
-            self._logger.log(
-                f'[ip] country={country} expected={expected_country} '
-                f'→ status={matched} (reason=expected_country)'
-            )
-            return matched
-
-        # 3. Home country mismatch
+        # 2. Home country mismatch (priority over expected_country)
         if home_country and country and country != '?':
             matched = country != home_country
             self._logger.log(
@@ -373,7 +373,15 @@ class VPNChecker:
             )
             return matched
 
-        # 4. No heuristics configured
+        # 3. Expected country match (only if home_country not set)
+        if expected_country and country and country != '?':
+            matched = country == expected_country
+            self._logger.log(
+                f'[ip] country={country} expected={expected_country} '
+                f'→ status={matched} (reason=expected_country)'
+            )
+            return matched
+
         if not expected_country and not home_country:
             self._logger.log(
                 f'[ip] country={country} → status=None (reason=no_heuristics)'
@@ -381,7 +389,7 @@ class VPNChecker:
             return None
 
         self._logger.log(
-            f'[ip] country={country} home={home_country} → status=False (reason=fallback)'
+            f'[ip] country={country} → status=False (reason=fallback)'
         )
         return False
 
@@ -448,16 +456,21 @@ class VPNChecker:
             f'Провайдер: {info.get("org", "-") if not info.get("error") else "-"}'
         )
 
-        if (
-            self.config.get('notifications', True)
-            and prev_status is not None
-            and status != prev_status
-        ):
-            self._logger.log(
-                f'[notify] prev={prev_status} → new={status} '
-                f'country={info.get("country","?")} iface={iface}'
-            )
-            self._notify(status, info)
+        # Notifications
+        if self.config.get('notifications', True):
+            if prev_status is None:
+                self._logger.log(f'[notify] skip: first run')
+            elif status == prev_status:
+                self._logger.log(f'[notify] skip: unchanged {status}')
+            else:
+                self._logger.log(
+                    f'[notify] prev={prev_status} → new={status} '
+                    f'country={info.get("country","?")} iface={iface}'
+                )
+                self._notify(status, info)
+
+        # Auto-strict mode
+        self._sync_strict_mode(self.last_status)
 
         return False  # single-shot idle callback
 
@@ -484,13 +497,63 @@ class VPNChecker:
         except Exception:
             pass
 
+    # -- Kill switch helpers ----------------------------------------------
+    def _run_killswitch(self, action):
+        """Run vpn_killswitch.py via pkexec non-blocking."""
+        script = Path(__file__).with_name('vpn_killswitch.py').resolve()
+        self._logger.log(f'[killswitch] action={action}')
+        try:
+            subprocess.Popen(
+                ['pkexec', sys.executable, str(script), action],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            self._logger.log('[killswitch] pkexec not found')
+            print('[vpn-checker] pkexec not found. Install policykit-1.')
+        except Exception as exc:
+            self._logger.log(f'[killswitch] error: {exc}')
+            print(f'[vpn-checker] Failed to run killswitch: {exc}')
+
+    def _sync_strict_mode(self, vpn_status):
+        """Auto-enable/disable strict kill switch based on VPN status."""
+        if not self.config.get('strict_mode'):
+            return
+        if vpn_status is False and not self._strict_active:
+            self._logger.log('[strict] VPN OFF → enabling kill switch')
+            self._run_killswitch('strict-on')
+            self._strict_active = True
+        elif vpn_status is True and self._strict_active:
+            self._logger.log('[strict] VPN ON → disabling kill switch')
+            self._run_killswitch('strict-off')
+            self._strict_active = False
+
     # -- Background checks ------------------------------------------------
     def _check_iface(self):
         """Fast check — runs in main thread (no network calls)."""
         if self._shutting_down:
             return
         config_snapshot = self.config.copy()
+        prev_iface = self._last_iface
         iface = get_default_iface()
+        prev_vpn = self._iface_looks_like_vpn(prev_iface) if prev_iface else False
+        now_vpn = self._iface_looks_like_vpn(iface)
+
+        # Optimistic transition: iface changed between VPN-like and non-VPN
+        if prev_iface is not None and prev_vpn != now_vpn:
+            if now_vpn:
+                self._logger.log(
+                    f'[iface] transition {prev_iface}→{iface} → assuming ON'
+                )
+                self._update_ui(True, None, iface)
+            else:
+                self._logger.log(
+                    f'[iface] transition {prev_iface}→{iface} → assuming OFF'
+                )
+                self._update_ui(False, None, iface)
+            self._check_now(self._check_ip)
+            return
+
         status = self._check_iface_status(iface, config_snapshot)
         self._update_ui(status, None, iface)
 
@@ -507,6 +570,9 @@ class VPNChecker:
             self._logger.log(f'[ip] API error: {info["error"]}')
             status = None
         else:
+            country = info.get('country', '')
+            if country and country != '?':
+                self._last_known_country = country.upper()
             status = self._check_ip_status(info, iface, config_snapshot)
         if not self._shutting_down:
             GLib.idle_add(self._update_ui, status, info, None)
@@ -554,7 +620,15 @@ class VPNChecker:
             active = widget.get_active()
             self.config['strict_mode'] = active
             save_config(self.config)
-            self._apply_killswitch()
+            if active:
+                self._logger.log('[strict] toggle ON')
+                # Trigger immediate sync based on current VPN status
+                self._sync_strict_mode(self.last_status)
+            else:
+                self._logger.log('[strict] toggle OFF')
+                if self._strict_active:
+                    self._run_killswitch('strict-off')
+                    self._strict_active = False
         finally:
             self._toggling = False
 
@@ -563,24 +637,11 @@ class VPNChecker:
         save_config(self.config)
 
     def _apply_killswitch(self):
-        script = Path(__file__).with_name('vpn_killswitch.py').resolve()
-        try:
-            if self.config.get('strict_mode'):
-                subprocess.Popen(
-                    ['pkexec', sys.executable, str(script), 'strict-on'],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                subprocess.Popen(
-                    ['pkexec', sys.executable, str(script), 'strict-off'],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-        except FileNotFoundError:
-            print('[vpn-checker] pkexec not found. Install policykit-1.')
-        except Exception as exc:
-            print(f'[vpn-checker] Failed to run killswitch: {exc}')
+        """Deprecated — kept for compatibility; use _run_killswitch."""
+        if self.config.get('strict_mode'):
+            self._run_killswitch('strict-on')
+        else:
+            self._run_killswitch('strict-off')
 
     # -- Settings ---------------------------------------------------------
     def _open_config(self, *_):
@@ -601,19 +662,9 @@ class VPNChecker:
             return
         self._shutting_down = True
 
-        script = Path(__file__).with_name('vpn_killswitch.py').resolve()
-        if self.config.get('strict_mode'):
+        if self.config.get('strict_mode') and self._strict_active:
             print('[vpn-checker] Disabling strict mode on exit...')
-            try:
-                subprocess.Popen(
-                    ['pkexec', sys.executable, str(script), 'strict-off'],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                print('[vpn-checker] pkexec not found.')
-            except Exception as exc:
-                print(f'[vpn-checker] Could not disable strict mode: {exc}')
+            self._run_killswitch('strict-off')
 
         Gtk.main_quit()
 
