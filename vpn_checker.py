@@ -332,10 +332,10 @@ class VPNChecker:
 
         # Use stored state for rendering
         status = self.last_status
-        info = self.last_info
+        info = self.last_info or {}
         iface = self._last_iface
 
-        flag = country_to_flag(info.get('country')) if (info and not info.get('error')) else '🏳️'
+        flag = country_to_flag(info.get('country')) if not info.get('error') else '🏳️'
 
         if status is True:
             label_text = f'{flag} VPN'
@@ -353,8 +353,8 @@ class VPNChecker:
             icon_name = 'dialog-question'
             status_text = '⚪ НЕИЗВЕСТЕН'
 
-        if info and not info.get('error'):
-            tooltip += f'\nIP: {info.get("ip")}\nПровайдер: {info.get("org", "?")}'
+        if not info.get('error'):
+            tooltip += f'\nIP: {info.get("ip", "?")}\nПровайдер: {info.get("org", "?")}'
 
         self.indicator.set_label(label_text, '')
         self.indicator.set_title('VPN Checker')
@@ -365,17 +365,17 @@ class VPNChecker:
 
         self.menu_items['status'].set_label(f'Статус: {status_text}')
         self.menu_items['ip'].set_label(
-            f'IP: {info.get("ip", "-") if info and not info.get("error") else "-"}'
+            f'IP: {info.get("ip", "-") if not info.get("error") else "-"}'
         )
 
         loc = '-'
-        if info and not info.get('error'):
+        if not info.get('error'):
             parts = [p for p in (info.get('city'), info.get('country_name')) if p]
             loc = ', '.join(parts) if parts else '-'
         self.menu_items['loc'].set_label(f'Локация: {flag} {loc}')
         self.menu_items['iface'].set_label(f'Интерфейс: {iface or "-"}')
         self.menu_items['org'].set_label(
-            f'Провайдер: {info.get("org", "-") if info and not info.get("error") else "-"}'
+            f'Провайдер: {info.get("org", "-") if not info.get("error") else "-"}'
         )
 
         if (
