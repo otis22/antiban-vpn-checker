@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 import gi
@@ -48,6 +49,8 @@ except (ValueError, ImportError):
 # Config paths
 CONFIG_DIR = Path.home() / '.config' / 'vpn-checker'
 CONFIG_FILE = CONFIG_DIR / 'config.json'
+CACHE_DIR = Path.home() / '.cache' / 'vpn-checker'
+LOG_FILE = CACHE_DIR / 'vpn-checker.log'
 
 # Check intervals
 IFACE_CHECK_INTERVAL = 3   # seconds — fast local check
@@ -66,6 +69,39 @@ IP_APIS = [
     'https://ipapi.co/json/',
     'https://ipinfo.io/json',
 ]
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+class _Logger:
+    _lock = threading.Lock()
+    MAX_BYTES = 500 * 1024
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _rotate(self):
+        if self.path.exists() and self.path.stat().st_size > self.MAX_BYTES:
+            backup = self.path.with_suffix('.log.old')
+            try:
+                if backup.exists():
+                    backup.unlink()
+                self.path.rename(backup)
+            except Exception:
+                pass
+
+    def log(self, msg):
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f'[{ts}] {msg}\n'
+        with self._lock:
+            try:
+                self._rotate()
+                with open(self.path, 'a', encoding='utf-8') as f:
+                    f.write(line)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +240,7 @@ class VPNChecker:
         self._check_in_progress = False
         self._shutting_down = False
         self._toggling = False
+        self._logger = _Logger(LOG_FILE)
 
         if HAVE_NOTIFY:
             try:
@@ -289,30 +326,63 @@ class VPNChecker:
         Returns True/False/None. None means 'cannot determine from iface alone'."""
         prefix = config_snapshot.get('expected_iface_prefix', '').strip().lower()
         if prefix:
-            return iface and iface.lower().startswith(prefix)
+            matched = iface and iface.lower().startswith(prefix)
+            self._logger.log(
+                f'[iface] iface={iface} prefix={prefix} → status={matched} (reason=prefix_match)'
+            )
+            return matched
         if self._iface_looks_like_vpn(iface):
+            self._logger.log(
+                f'[iface] iface={iface} → status=True (reason=heuristic)'
+            )
             return True
+        self._logger.log(
+            f'[iface] iface={iface} → status=None (reason=no_prefix,heuristic=no_match)'
+        )
         return None
 
     def _check_ip_status(self, info, iface, config_snapshot):
-        """Status check based on IP geolocation.
+        """Status check based on IP geolocation and iface heuristic.
         Returns True/False/None. None means 'cannot determine from IP alone'."""
+        # 1. Local iface heuristic — most reliable, check first
+        if self._iface_looks_like_vpn(iface):
+            self._logger.log(
+                f'[ip] iface={iface} → status=True (reason=iface_heuristic)'
+            )
+            return True
+
         expected_country = config_snapshot.get('expected_country', '').strip().upper()
         home_country = config_snapshot.get('home_country', '').strip().upper()
         country = info.get('country', '?') if info else '?'
 
+        # 2. Expected country match
         if expected_country and country and country != '?':
-            return country == expected_country
+            matched = country == expected_country
+            self._logger.log(
+                f'[ip] country={country} expected={expected_country} '
+                f'→ status={matched} (reason=expected_country)'
+            )
+            return matched
 
+        # 3. Home country mismatch
         if home_country and country and country != '?':
-            return country != home_country
+            matched = country != home_country
+            self._logger.log(
+                f'[ip] country={country} home={home_country} '
+                f'→ status={matched} (reason=home_country)'
+            )
+            return matched
 
-        if self._iface_looks_like_vpn(iface):
-            return True
-
+        # 4. No heuristics configured
         if not expected_country and not home_country:
+            self._logger.log(
+                f'[ip] country={country} → status=None (reason=no_heuristics)'
+            )
             return None
 
+        self._logger.log(
+            f'[ip] country={country} home={home_country} → status=False (reason=fallback)'
+        )
         return False
 
     # -- UI update (must run on main thread) ------------------------------
@@ -383,6 +453,10 @@ class VPNChecker:
             and prev_status is not None
             and status != prev_status
         ):
+            self._logger.log(
+                f'[notify] prev={prev_status} → new={status} '
+                f'country={info.get("country","?")} iface={iface}'
+            )
             self._notify(status, info)
 
         return False  # single-shot idle callback
@@ -426,13 +500,14 @@ class VPNChecker:
             if self._shutting_down:
                 return
             config_snapshot = self.config.copy()
-            last_iface_snapshot = self._last_iface
         info = get_public_ip_info()
+        # Get iface AFTER the network call so it matches the moment we got the IP
+        iface = get_default_iface()
         if info.get('error'):
-            print(f'[vpn-checker] IP check error: {info["error"]}')
+            self._logger.log(f'[ip] API error: {info["error"]}')
             status = None
         else:
-            status = self._check_ip_status(info, last_iface_snapshot, config_snapshot)
+            status = self._check_ip_status(info, iface, config_snapshot)
         if not self._shutting_down:
             GLib.idle_add(self._update_ui, status, info, None)
 
