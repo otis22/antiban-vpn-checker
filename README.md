@@ -140,20 +140,42 @@ sudo apt install ip6tables
 
 Kill switch реагирует примерно за **1 секунду**. За это время короткий запрос теоретически может уйти напрямую.
 
-Самый простой способ гарантировать, что CLI-инструменты ходят через VPN — запускать их с proxy-переменными окружения, указывающими на локальный прокси:
+Более надёжный паттерн — запускать AI CLI через **wrapper + OS-level firewall guard**:
+
+**Wrapper** задаёт proxy-переменные:
 
 ```bash
-HTTPS_PROXY=http://127.0.0.1:<port> \
-HTTP_PROXY=http://127.0.0.1:<port> \
-ALL_PROXY=socks5h://127.0.0.1:<port> \
-<команда>
+export HTTPS_PROXY=http://127.0.0.1:<port>
+export HTTP_PROXY=http://127.0.0.1:<port>
+export ALL_PROXY=socks5h://127.0.0.1:<port>
+exec "$@"
 ```
 
-Проверь fail-closed: укажи заведомо закрытый порт и убедись, что команда падает с ошибкой соединения, а не обходит прокси.
+**Preflight**: перед запуском проверь, что proxy/TUN/VPN в ожидаемом состоянии.
 
-Это не анонимность — аккаунты и телеметрия всё равно идентифицируют сессию. Это только принудительная маршрутизация исходящих соединений через локальный прокси.
+**Runtime guard**: процесс запускается в отдельной Unix-группе или security context. Firewall разрешает этой группе только соединение к `127.0.0.1:<port>` и блокирует весь остальной outbound, включая IPv6.
 
-Для статически слинкованных бинарников предпочитай env-переменные вместо `proxychains4`, потому что `LD_PRELOAD` с ними работает ненадёжно. Для других динамически слинкованных CLI `proxychains4` можно использовать как запасной вариант.
+> ⚠️ Env proxy сам по себе **не является kill-switch**. Без firewall guard процесс может обойти proxy или уйти напрямую.
+
+**Шаблон команд**:
+
+```bash
+# Установить wrapper и guard
+sudo install -m 755 wrapper.sh /usr/local/bin/ai-wrapper
+sudo ai-fw-guard enable --proxy-port <port>
+
+# Проверить fail-closed: прямой curl из guarded context не работает
+sudo -g ai_guarded curl https://ifconfig.me
+# → ожидается: timeout / connection refused
+
+# Проверить, что через proxy работает
+HTTPS_PROXY=http://127.0.0.1:<port> sudo -g ai_guarded curl https://ifconfig.me
+
+# Запускать AI CLI через wrapper
+ai-wrapper <ai_cli_command>
+```
+
+Tray/status-checker утилита помогает мониторить VPN вручную, но **не заменяет firewall guard**.
 
 ---
 
