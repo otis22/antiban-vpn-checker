@@ -54,7 +54,7 @@ LOG_FILE = CACHE_DIR / 'vpn-checker.log'
 
 # Check intervals
 IFACE_CHECK_INTERVAL = 1    # seconds — fast local check
-IP_CHECK_INTERVAL = 60      # seconds — slow API check
+IP_CHECK_INTERVAL = 120     # seconds — slow API check
 
 DEFAULT_CONFIG = {
     'expected_country': '',
@@ -243,6 +243,9 @@ class VPNChecker:
         self._shutting_down = False
         self._toggling = False
         self._logger = _Logger(LOG_FILE)
+        self._pending_off_generation = 0
+        self._pending_off_active = False
+        self._force_notify = False
 
         if HAVE_NOTIFY:
             try:
@@ -460,14 +463,18 @@ class VPNChecker:
         if self.config.get('notifications', True):
             if prev_status is None:
                 self._logger.log(f'[notify] skip: first run')
-            elif status == prev_status:
+            elif status == prev_status and not self._force_notify:
                 self._logger.log(f'[notify] skip: unchanged {status}')
             else:
-                self._logger.log(
-                    f'[notify] prev={prev_status} → new={status} '
-                    f'country={info.get("country","?")} iface={iface}'
-                )
-                self._notify(status, info)
+                if status is False and self._pending_off_active:
+                    self._logger.log('[notify] skip: waiting for IP confirmation')
+                else:
+                    self._logger.log(
+                        f'[notify] prev={prev_status} → new={status} '
+                        f'country={info.get("country","?")} iface={iface}'
+                    )
+                    self._notify(status, info)
+                    self._force_notify = False
 
         # Auto-strict mode
         self._sync_strict_mode(self.last_status)
@@ -487,9 +494,21 @@ class VPNChecker:
                     'network-vpn',
                 )
             else:
+                # Fallback to last known country if current info is empty
+                if not info or not info.get('country'):
+                    if self._last_known_country:
+                        info = dict(info or {})
+                        info['country'] = self._last_known_country
+                        info['country_name'] = self._last_known_country
+                flag = country_to_flag(info.get('country')) if info else ''
+                country_text = ''
+                if info:
+                    c = info.get('country_name', info.get('country', ''))
+                    if c:
+                        country_text = f'{flag} {c}\n'
                 n = Notify.Notification.new(
                     '⚠️ VPN ОТКЛЮЧЕН',
-                    'Трафик идет напрямую! Подключи VPN.',
+                    f'{country_text}Трафик идет напрямую! Подключи VPN.',
                     'dialog-warning',
                 )
             n.set_timeout(8000)
@@ -538,26 +557,43 @@ class VPNChecker:
         iface = get_default_iface()
         prev_vpn = self._iface_looks_like_vpn(prev_iface) if prev_iface else False
         now_vpn = self._iface_looks_like_vpn(iface)
+        prev_status = self.last_status
 
         # Optimistic transition: iface changed between VPN-like and non-VPN
         if prev_iface is not None and prev_vpn != now_vpn:
             if now_vpn:
+                with self._check_lock:
+                    self._pending_off_active = False
+                    self._pending_off_generation += 1
                 self._logger.log(
                     f'[iface] transition {prev_iface}→{iface} → assuming ON'
                 )
                 self._update_ui(True, None, iface)
             else:
+                with self._check_lock:
+                    self._pending_off_generation += 1
+                    self._pending_off_active = True
+                    gen = self._pending_off_generation
                 self._logger.log(
-                    f'[iface] transition {prev_iface}→{iface} → assuming OFF'
+                    f'[iface] transition {prev_iface}→{iface} → scheduling IP confirmation'
                 )
                 self._update_ui(False, None, iface)
-            self._check_now(self._check_ip)
+                self._check_now(lambda: self._check_ip(confirm_generation=gen))
             return
 
         status = self._check_iface_status(iface, config_snapshot)
+        if status is False and prev_status is not False:
+            with self._check_lock:
+                self._pending_off_generation += 1
+                self._pending_off_active = True
+                gen = self._pending_off_generation
+            self._logger.log(
+                f'[iface] suspected OFF (iface={iface}), scheduling IP confirmation'
+            )
+            self._check_now(lambda: self._check_ip(confirm_generation=gen))
         self._update_ui(status, None, iface)
 
-    def _check_ip(self):
+    def _check_ip(self, confirm_generation=None):
         """Slow check — runs in worker thread (network API call)."""
         with self._check_lock:
             if self._shutting_down:
@@ -575,6 +611,18 @@ class VPNChecker:
                 self._last_known_country = country.upper()
             status = self._check_ip_status(info, iface, config_snapshot)
         if not self._shutting_down:
+            if confirm_generation is not None:
+                with self._check_lock:
+                    if self._pending_off_active and confirm_generation == self._pending_off_generation:
+                        self._pending_off_active = False
+                        self._force_notify = True
+                        if status is None and self._last_known_country:
+                            info = {
+                                'country': self._last_known_country,
+                                'country_name': self._last_known_country,
+                                'ip': info.get('ip', '?') if info else '?',
+                                'error': None,
+                            }
             GLib.idle_add(self._update_ui, status, info, None)
 
     def _check_now(self, target_fn):
